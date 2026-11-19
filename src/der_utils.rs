@@ -307,7 +307,37 @@ pub fn integer_bodies_equal(a: &[u8], b: &[u8]) -> bool {
     parse_integer_body(a) == parse_integer_body(b)
 }
 
-/// Parse a DER-encoded GeneralizedTime body (no tag/length) to a chrono DateTime.
+/// Convert a UTC calendar date and time to a [`jiff::Timestamp`].
+///
+/// Rejects out-of-range fields (month 13, second 60, 30 February, ...).
+///
+/// `jiff::Timestamp` stops just short of the calendar bounds (its maximum is
+/// `9999-12-30T22:00:00.999999999Z`), so a valid date beyond it saturates to
+/// [`jiff::Timestamp::MAX`] / [`jiff::Timestamp::MIN`] instead of failing. This
+/// keeps the RFC 5280 §4.1.2.5 "no well-defined expiration" value
+/// `99991231235959Z` usable.
+pub fn utc_civil_to_timestamp(
+    year: i16,
+    month: i8,
+    day: i8,
+    hour: i8,
+    min: i8,
+    sec: i8,
+) -> Result<jiff::Timestamp, String> {
+    let date = jiff::civil::Date::new(year, month, day)
+        .map_err(|_| format!("invalid date: {year}-{month}-{day}"))?;
+    let time = jiff::civil::Time::new(hour, min, sec, 0)
+        .map_err(|_| format!("invalid time: {hour}:{min}:{sec}"))?;
+    Ok(jiff::tz::TimeZone::UTC
+        .to_timestamp(date.to_datetime(time))
+        .unwrap_or(if year > 0 {
+            jiff::Timestamp::MAX
+        } else {
+            jiff::Timestamp::MIN
+        }))
+}
+
+/// Parse a DER-encoded GeneralizedTime body (no tag/length) to a [`jiff::Timestamp`].
 ///
 /// Format: `YYYYMMDDHHMMSSZ` or `YYYYMMDDHHMMSS.fracZ`
 ///
@@ -315,7 +345,7 @@ pub fn integer_bodies_equal(a: &[u8], b: &[u8]) -> bool {
 ///
 /// The string is checked to be ASCII before any indexing on the `&str`, so a
 /// multi-byte UTF-8 character cannot cause a mid-character slice panic.
-pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
+pub fn parse_generalized_time(body: &[u8]) -> Result<jiff::Timestamp, String> {
     let s =
         std::str::from_utf8(body).map_err(|e| format!("GeneralizedTime: invalid UTF-8: {e}"))?;
 
@@ -337,23 +367,17 @@ pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Ut
         return Err(format!("GeneralizedTime too short: {s}"));
     }
 
-    let year: i32 = s[0..4].parse().map_err(|e| format!("year: {e}"))?;
-    let month: u32 = s[4..6].parse().map_err(|e| format!("month: {e}"))?;
-    let day: u32 = s[6..8].parse().map_err(|e| format!("day: {e}"))?;
-    let hour: u32 = s[8..10].parse().map_err(|e| format!("hour: {e}"))?;
-    let min: u32 = s[10..12].parse().map_err(|e| format!("minute: {e}"))?;
-    let sec: u32 = s[12..14].parse().map_err(|e| format!("second: {e}"))?;
+    let year: i16 = s[0..4].parse().map_err(|e| format!("year: {e}"))?;
+    let month: i8 = s[4..6].parse().map_err(|e| format!("month: {e}"))?;
+    let day: i8 = s[6..8].parse().map_err(|e| format!("day: {e}"))?;
+    let hour: i8 = s[8..10].parse().map_err(|e| format!("hour: {e}"))?;
+    let min: i8 = s[10..12].parse().map_err(|e| format!("minute: {e}"))?;
+    let sec: i8 = s[12..14].parse().map_err(|e| format!("second: {e}"))?;
 
-    use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
-    let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| format!("invalid date: {year}-{month}-{day}"))?;
-    let time = NaiveTime::from_hms_opt(hour, min, sec)
-        .ok_or_else(|| format!("invalid time: {hour}:{min}:{sec}"))?;
-    let dt = NaiveDateTime::new(date, time);
-    Ok(chrono::Utc.from_utc_datetime(&dt))
+    utc_civil_to_timestamp(year, month, day, hour, min, sec)
 }
 
-/// Parse a DER-encoded UTCTime body (no tag/length) to a chrono DateTime.
+/// Parse a DER-encoded UTCTime body (no tag/length) to a [`jiff::Timestamp`].
 ///
 /// Format: `YYMMDDHHMMSSZ`
 ///
@@ -361,7 +385,7 @@ pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Ut
 ///
 /// The string is checked to be ASCII before any indexing on the `&str`, so a
 /// multi-byte UTF-8 character cannot cause a mid-character slice panic.
-pub fn parse_utc_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
+pub fn parse_utc_time(body: &[u8]) -> Result<jiff::Timestamp, String> {
     let s = std::str::from_utf8(body).map_err(|e| format!("UTCTime: invalid UTF-8: {e}"))?;
 
     if !s.is_ascii() {
@@ -374,27 +398,21 @@ pub fn parse_utc_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, Stri
         return Err(format!("UTCTime too short: {s}"));
     }
 
-    let yy: i32 = s[0..2].parse().map_err(|e| format!("year: {e}"))?;
+    let yy: i16 = s[0..2].parse().map_err(|e| format!("year: {e}"))?;
     // RFC 5280 §4.1.2.5.1: values 0-49 → 2000-2049, 50-99 → 1950-1999
     let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
-    let month: u32 = s[2..4].parse().map_err(|e| format!("month: {e}"))?;
-    let day: u32 = s[4..6].parse().map_err(|e| format!("day: {e}"))?;
-    let hour: u32 = s[6..8].parse().map_err(|e| format!("hour: {e}"))?;
-    let min: u32 = s[8..10].parse().map_err(|e| format!("minute: {e}"))?;
-    let sec: u32 = s[10..12].parse().map_err(|e| format!("second: {e}"))?;
+    let month: i8 = s[2..4].parse().map_err(|e| format!("month: {e}"))?;
+    let day: i8 = s[4..6].parse().map_err(|e| format!("day: {e}"))?;
+    let hour: i8 = s[6..8].parse().map_err(|e| format!("hour: {e}"))?;
+    let min: i8 = s[8..10].parse().map_err(|e| format!("minute: {e}"))?;
+    let sec: i8 = s[10..12].parse().map_err(|e| format!("second: {e}"))?;
 
-    use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
-    let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| format!("invalid date: {year}-{month}-{day}"))?;
-    let time = NaiveTime::from_hms_opt(hour, min, sec)
-        .ok_or_else(|| format!("invalid time: {hour}:{min}:{sec}"))?;
-    let dt = NaiveDateTime::new(date, time);
-    Ok(chrono::Utc.from_utc_datetime(&dt))
+    utc_civil_to_timestamp(year, month, day, hour, min, sec)
 }
 
 /// Parse a time value that could be either UTCTime (tag 0x17) or
 /// GeneralizedTime (tag 0x18).
-pub fn parse_x509_time(tag: u8, body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
+pub fn parse_x509_time(tag: u8, body: &[u8]) -> Result<jiff::Timestamp, String> {
     match tag {
         0x17 => parse_utc_time(body),
         0x18 => parse_generalized_time(body),
@@ -577,31 +595,47 @@ mod tests {
     #[test]
     fn test_parse_generalized_time() {
         let dt = parse_generalized_time(b"20260303120000Z").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-03-03T12:00:00+00:00");
+        assert_eq!(dt.to_string(), "2026-03-03T12:00:00Z");
 
         // With fractional seconds
         let dt = parse_generalized_time(b"20260303120000.5Z").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-03-03T12:00:00+00:00");
+        assert_eq!(dt.to_string(), "2026-03-03T12:00:00Z");
     }
 
     #[test]
     fn test_parse_utc_time() {
         // 26 → 2026
         let dt = parse_utc_time(b"260303120000Z").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-03-03T12:00:00+00:00");
+        assert_eq!(dt.to_string(), "2026-03-03T12:00:00Z");
 
         // 99 → 1999
         let dt = parse_utc_time(b"990101000000Z").unwrap();
-        assert_eq!(dt.to_rfc3339(), "1999-01-01T00:00:00+00:00");
+        assert_eq!(dt.to_string(), "1999-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_parse_time_rejects_out_of_range_fields() {
+        assert!(parse_generalized_time(b"20261303120000Z").is_err());
+        assert!(parse_generalized_time(b"20260230120000Z").is_err());
+        assert!(parse_generalized_time(b"20260303240000Z").is_err());
+        assert!(parse_generalized_time(b"20260303120060Z").is_err());
+        assert!(parse_utc_time(b"261303120000Z").is_err());
+    }
+
+    #[test]
+    fn test_parse_time_saturates_at_timestamp_bounds() {
+        // RFC 5280 "no well-defined expiration" lies past jiff::Timestamp::MAX.
+        let dt = parse_generalized_time(b"99991231235959Z").unwrap();
+        assert_eq!(dt, jiff::Timestamp::MAX);
     }
 
     #[test]
     fn test_parse_x509_time() {
         let dt = parse_x509_time(0x17, b"260303120000Z").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-03-03T12:00:00+00:00");
+        assert_eq!(dt.to_string(), "2026-03-03T12:00:00Z");
 
         let dt = parse_x509_time(0x18, b"20260303120000Z").unwrap();
-        assert_eq!(dt.to_rfc3339(), "2026-03-03T12:00:00+00:00");
+        assert_eq!(dt.to_string(), "2026-03-03T12:00:00Z");
 
         assert!(parse_x509_time(0x04, b"whatever").is_err());
     }

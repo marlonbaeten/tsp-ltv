@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.7.0 [2026-11-19]
+
+### Changed
+
+- **Breaking:** replace `chrono` with `jiff` 1.0. Public APIs now take and
+  return `jiff::Timestamp` instead of `chrono::DateTime<Utc>`, and
+  `OcspFreshness` / `CrlFreshness` use `jiff::SignedDuration` instead of
+  `chrono::Duration`.
+- Parsed times beyond `jiff::Timestamp::MAX` (such as `99991231235959Z`)
+  saturate instead of being rejected, and freshness checks can no longer
+  overflow on them.
+
 ## 0.6.1 [2026-11-09]
 
 ### Security

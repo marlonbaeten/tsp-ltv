@@ -200,7 +200,7 @@ impl CrlClient {
                 .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(url) {
                 if entry.fetched_at.elapsed() < self.grace_period
-                    && crl_is_current(&entry.der, chrono::Utc::now(), freshness)
+                    && crl_is_current(&entry.der, jiff::Timestamp::now(), freshness)
                 {
                     log::debug!("CRL cache hit for {url}");
                     return Ok(entry.der.clone());
@@ -334,7 +334,7 @@ impl CrlClient {
                     // otherwise an endpoint that crosses nextUpdate while earlier
                     // fetches run could still be returned and then rejected
                     // downstream, shadowing a later fresh distribution point.
-                    if crl_is_current(&crl, chrono::Utc::now(), freshness) {
+                    if crl_is_current(&crl, jiff::Timestamp::now(), freshness) {
                         // Current CRL at this distribution point — authoritative.
                         return Ok(vec![crl]);
                     }
@@ -437,7 +437,7 @@ pub struct RevokedEntry {
     /// Serial number of the revoked certificate (leading-zero-stripped).
     pub serial_number: Vec<u8>,
     /// When the certificate was revoked.
-    pub revocation_time: chrono::DateTime<chrono::Utc>,
+    pub revocation_time: jiff::Timestamp,
     /// Reason for revocation, if present in CRL entry extensions.
     pub reason: RevocationReason,
 }
@@ -454,9 +454,9 @@ pub struct ParsedCrl {
     /// CRL issuer distinguished name (raw DER of the Name SEQUENCE).
     pub issuer_der: Vec<u8>,
     /// thisUpdate timestamp.
-    pub this_update: chrono::DateTime<chrono::Utc>,
+    pub this_update: jiff::Timestamp,
     /// nextUpdate timestamp, if present.
-    pub next_update: Option<chrono::DateTime<chrono::Utc>>,
+    pub next_update: Option<jiff::Timestamp>,
     /// Revoked certificate entries.
     pub revoked_entries: Vec<RevokedEntry>,
 }
@@ -879,20 +879,20 @@ pub struct CrlFreshness {
     /// currentness check (`crl_is_current`) additionally uses it as a
     /// not-yet-valid tolerance, since for caching a CRL whose window is still in
     /// the future is not yet the issuer's live list.
-    pub clock_skew: chrono::Duration,
+    pub clock_skew: jiff::SignedDuration,
 
     /// Maximum age (measured from `thisUpdate`) tolerated for a CRL that omits
     /// the optional `nextUpdate` field. RFC 5280 makes `nextUpdate` optional;
     /// rather than treat such a CRL as eternally fresh, it is rejected once it is
     /// older than this bound. Default: 24 hours.
-    pub max_age_without_next_update: chrono::Duration,
+    pub max_age_without_next_update: jiff::SignedDuration,
 }
 
 impl Default for CrlFreshness {
     fn default() -> Self {
         Self {
-            clock_skew: chrono::Duration::minutes(5),
-            max_age_without_next_update: chrono::Duration::hours(24),
+            clock_skew: jiff::SignedDuration::from_mins(5),
+            max_age_without_next_update: jiff::SignedDuration::from_hours(24),
         }
     }
 }
@@ -916,7 +916,7 @@ impl Default for CrlFreshness {
 /// CRL), never the fail-open `Unknown`.
 fn validate_crl_freshness(
     parsed: &ParsedCrl,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     freshness: &CrlFreshness,
 ) -> Result<(), LtvError> {
     let skew = freshness.clock_skew;
@@ -933,7 +933,7 @@ fn validate_crl_freshness(
             // Anti-replay: reject once the validation instant is past nextUpdate.
             // (A CRL whose window lies at/after the validation instant —
             // later-collected archival evidence — is not stale and is kept.)
-            if now > next_update + skew {
+            if now.duration_since(next_update) > skew {
                 return Err(LtvError::Crl(format!(
                     "CRL is stale: nextUpdate ({next_update}) is before validation time ({now})"
                 )));
@@ -943,8 +943,8 @@ fn validate_crl_freshness(
             // No nextUpdate: bound the CRL's age from thisUpdate so an old CRL
             // cannot be relied on indefinitely. A CRL whose window starts at/after
             // the validation time is always within bound.
-            let max_valid = parsed.this_update + freshness.max_age_without_next_update + skew;
-            if now > max_valid {
+            let max_age = freshness.max_age_without_next_update.saturating_add(skew);
+            if now.duration_since(parsed.this_update) > max_age {
                 return Err(LtvError::Crl(format!(
                     "CRL without nextUpdate is too old: thisUpdate ({}), validation time ({now}), max age {}",
                     parsed.this_update, freshness.max_age_without_next_update
@@ -969,16 +969,12 @@ fn validate_crl_freshness(
 /// archival "later-collected evidence" carve-out lives in the orchestrator's
 /// `validation_time` check, not here.) An unparseable CRL is treated as not
 /// current so it is re-fetched rather than trusted.
-fn crl_is_current(
-    der: &[u8],
-    now: chrono::DateTime<chrono::Utc>,
-    freshness: &CrlFreshness,
-) -> bool {
+fn crl_is_current(der: &[u8], now: jiff::Timestamp, freshness: &CrlFreshness) -> bool {
     let Ok(parsed) = parse_crl(der) else {
         return false;
     };
     // Not yet valid (window starts in the future, beyond skew) → not current.
-    if now + freshness.clock_skew < parsed.this_update {
+    if parsed.this_update.duration_since(now) > freshness.clock_skew {
         return false;
     }
     // Past nextUpdate / max-age → not current.
@@ -1009,7 +1005,7 @@ pub fn check_revocation(
     crl_der: &[u8],
     cert: &Certificate,
     issuer: &Certificate,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<jiff::Timestamp>,
 ) -> Result<ValidationStatus, LtvError> {
     check_revocation_with_policy(
         crl_der,
@@ -1030,7 +1026,7 @@ pub fn check_revocation_with_policy(
     crl_der: &[u8],
     cert: &Certificate,
     issuer: &Certificate,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<jiff::Timestamp>,
     policy: &crate::crypto::verify::SignaturePolicy,
 ) -> Result<ValidationStatus, LtvError> {
     check_revocation_with_options(
@@ -1055,11 +1051,11 @@ pub fn check_revocation_with_options(
     crl_der: &[u8],
     cert: &Certificate,
     issuer: &Certificate,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<jiff::Timestamp>,
     policy: &crate::crypto::verify::SignaturePolicy,
     freshness: &CrlFreshness,
 ) -> Result<ValidationStatus, LtvError> {
-    let now = validation_time.unwrap_or_else(chrono::Utc::now);
+    let now = validation_time.unwrap_or_else(jiff::Timestamp::now);
 
     // 1. Parse CRL
     let parsed = parse_crl(crl_der)?;
@@ -1322,7 +1318,7 @@ mod tests {
 
         assert!(parsed.revoked_entries.is_empty());
         assert!(parsed.next_update.is_some());
-        assert_eq!(parsed.this_update.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(parsed.this_update.to_string(), "2026-01-01T00:00:00Z");
     }
 
     #[test]
@@ -1547,9 +1543,7 @@ mod tests {
 
         // CRL with no revoked entries
         let crl_der = build_test_crl(&issuer, &key_pem, &[]);
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = "2026-06-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
         let status = check_revocation(&crl_der, &cert, &issuer, Some(validation_time)).unwrap();
         assert!(status.is_valid(), "should be valid: {status}");
@@ -1572,9 +1566,7 @@ mod tests {
         // CRL with the signer's serial revoked
         let revoked = vec![(serial, "250601120000Z")];
         let crl_der = build_test_crl(&issuer, &key_pem, &revoked);
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = "2026-06-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
         let status = check_revocation(&crl_der, &cert, &issuer, Some(validation_time)).unwrap();
         assert!(status.is_revoked(), "should be revoked: {status}");
@@ -1597,9 +1589,7 @@ mod tests {
         // → cert should be VALID at validation_time
         let revoked = vec![(serial, "270101120000Z")];
         let crl_der = build_test_crl(&issuer, &key_pem, &revoked);
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = "2026-06-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
         let status = check_revocation(&crl_der, &cert, &issuer, Some(validation_time)).unwrap();
         assert!(
@@ -1626,9 +1616,7 @@ mod tests {
         // CRL window is thisUpdate 2026-01-01 / nextUpdate 2027-01-01.
         let crl_der = build_test_crl(&issuer, &key_pem, &[]);
         // Validate well past nextUpdate (+ skew): the CRL is stale.
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2027-06-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = "2027-06-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
         let result = check_revocation(&crl_der, &cert, &issuer, Some(validation_time));
         assert!(
@@ -1646,10 +1634,8 @@ mod tests {
         Some(parse_crl(&crl_der).unwrap())
     }
 
-    fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .unwrap()
-            .with_timezone(&chrono::Utc)
+    fn instant(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
     }
 
     #[test]
@@ -1757,7 +1743,7 @@ mod tests {
             return;
         };
         // nextUpdate before thisUpdate is malformed → rejected.
-        parsed.next_update = Some(parsed.this_update - chrono::Duration::hours(1));
+        parsed.next_update = Some(parsed.this_update - jiff::SignedDuration::from_hours(1));
         let res = validate_crl_freshness(
             &parsed,
             instant("2026-06-01T00:00:00Z"),
@@ -1788,10 +1774,10 @@ mod tests {
     /// A UTCTime string (`"YYMMDDHHMMSSZ"`) `days_offset` days from *now*. Used by
     /// the wall-clock-driven fetch/cache tests so they never time-bomb when the
     /// real date moves past a hard-coded window (`fetch_crl` compares against
-    /// `Utc::now()` internally, so the window must track the wall clock).
+    /// `Timestamp::now()` internally, so the window must track the wall clock).
     fn utctime_from_now(days_offset: i64) -> String {
-        (chrono::Utc::now() + chrono::Duration::days(days_offset))
-            .format("%y%m%d%H%M%SZ")
+        (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24 * days_offset))
+            .strftime("%y%m%d%H%M%SZ")
             .to_string()
     }
 
@@ -1921,7 +1907,7 @@ mod tests {
     async fn test_fetch_crl_serves_fresh_cache_entry() {
         // A cached CRL that is within both the grace period and its own validity
         // window is served without touching the network. The window is built
-        // relative to `Utc::now()` so the test is wall-clock-independent.
+        // relative to `Timestamp::now()` so the test is wall-clock-independent.
         let this_update = utctime_from_now(-1);
         let next_update = utctime_from_now(365);
         let Some(der) = build_crl_or_skip(&this_update, Some(&next_update)) else {
@@ -1951,7 +1937,7 @@ mod tests {
         // though it is within the grace period; the client falls through to a
         // network fetch (which here fails against an unreachable host), proving it
         // did not return the stale cached object. The window is built relative to
-        // `Utc::now()` (a year-old, year-expired CRL) so the test never time-bombs.
+        // `Timestamp::now()` (a year-old, year-expired CRL) so the test never time-bombs.
         let this_update = utctime_from_now(-730);
         let next_update = utctime_from_now(-365);
         let Some(stale) = build_crl_or_skip(&this_update, Some(&next_update)) else {
